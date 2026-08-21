@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from fastapi import HTTPException
+from pydantic import ValidationError
+
+from ..config import OPENAI_API_KEY, OPENAI_MODEL, OPENAI_TIMEOUT_SECONDS
+from ..database import get_connection
+from ..schemas import ProcessMiningAdvisorResponse
+from .process_mining import analyze_workflow_process
+
+
+def _load_workflow_name(*, workflow_id: int, user_id: int) -> str:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT name FROM workflows WHERE id = ? AND user_id = ?",
+            (workflow_id, user_id),
+        ).fetchone()
+    return str(row[0]) if row else f"Workflow {workflow_id}"
+
+
+def _compact_evidence(analysis: dict[str, Any]) -> dict[str, Any]:
+    summary = analysis.get("summary", {})
+    conformance = analysis.get("conformance", {})
+
+    return {
+        "summary": {
+            "analyzed_runs": summary.get("analyzed_runs", 0),
+            "success_rate_percent": summary.get("success_rate", 0),
+            "variant_count": summary.get("variant_count", 0),
+            "repeated_run_rate_percent": summary.get("repeated_run_rate", 0),
+            "average_duration_ms": summary.get("average_duration_ms"),
+            "average_total_tokens": summary.get("average_total_tokens"),
+        },
+        "top_variants": [
+            {
+                "path": item.get("path", []),
+                "count": item.get("count", 0),
+                "percentage": item.get("percentage", 0),
+                "failure_rate_percent": item.get("failure_rate", 0),
+            }
+            for item in analysis.get("variants", [])[:5]
+        ],
+        "agent_performance": [
+            {
+                "activity": item.get("activity", ""),
+                "execution_count": item.get("execution_count", 0),
+                "failure_rate_percent": item.get("failure_rate", 0),
+                "average_duration_ms": item.get("average_duration_ms"),
+                "average_total_tokens": item.get("average_total_tokens"),
+            }
+            for item in analysis.get("activities", [])[:10]
+        ],
+        "conformance": {
+            "mode": conformance.get("mode", "sequential"),
+            "checked_runs": conformance.get("checked_runs", 0),
+            "conformant_runs": conformance.get("conformant_runs", 0),
+            "nonconformant_runs": conformance.get("nonconformant_runs", 0),
+            "conformance_score_percent": conformance.get("conformance_score", 0),
+            "deviation_counts": conformance.get("deviation_counts", {}),
+        },
+        "detected_issues": analysis.get("issues", [])[:8],
+        "rule_based_recommendations": analysis.get("recommendations", [])[:8],
+    }
+
+
+def _extract_json(text: str) -> dict[str, Any]:
+    candidate = text.strip()
+    if candidate.startswith("```"):
+        lines = candidate.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        candidate = "\n".join(lines).strip()
+
+    try:
+        value = json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Process Mining Advisor returned an invalid structured response.",
+        ) from exc
+
+    if not isinstance(value, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Process Mining Advisor returned an invalid response object.",
+        )
+    return value
+
+
+def generate_process_mining_advice(*, workflow_id: int, user_id: int) -> ProcessMiningAdvisorResponse:
+    if not OPENAI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Process Mining Advisor is unavailable because OPENAI_API_KEY is not configured.",
+        )
+
+    analysis = analyze_workflow_process(workflow_id=workflow_id, user_id=user_id)
+    evidence = _compact_evidence(analysis)
+    workflow_name = _load_workflow_name(workflow_id=workflow_id, user_id=user_id)
+
+    analyzed_runs = int(evidence["summary"].get("analyzed_runs") or 0)
+    if analyzed_runs == 0:
+        return ProcessMiningAdvisorResponse(
+            workflow_id=workflow_id,
+            workflow_name=workflow_name,
+            analyzed_runs=0,
+            evidence_strength="none",
+            overview="There are no completed or failed workflow runs to analyze yet.",
+            recommendations=[],
+            disclaimer="Advice is based only on Process Mining evidence and does not modify the workflow.",
+        )
+
+    try:
+        from openai import APITimeoutError, OpenAI, OpenAIError
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail="OpenAI SDK is not installed.") from exc
+
+    instructions = """
+You are a Process Mining optimization advisor for multi-agent workflows.
+You receive ONLY structured evidence generated by a deterministic Process Mining module.
+
+Your job is to explain the most important findings and propose evidence-based improvements.
+Do not invent events, failures, causal relationships, token savings, latency savings, or workflow behavior that is not present in the supplied evidence.
+Do not recommend changing a workflow merely because multiple variants exist: conditional variants can be intentional.
+Treat conformance as adherence to the designed workflow, not as correctness, quality, or optimality.
+When evidence is limited, explicitly say so.
+Prefer deterministic backend/tool logic over LLM reasoning for facts that can be calculated exactly.
+Do not automatically apply or claim to apply any optimization.
+
+Return ONLY valid JSON with exactly this shape:
+{
+  "overview": "2-4 sentence evidence-grounded summary",
+  "evidence_strength": "limited|growing|stronger",
+  "recommendations": [
+    {
+      "priority": "high|medium|low",
+      "title": "short title",
+      "evidence": "specific evidence from the supplied Process Mining data",
+      "recommendation": "specific action to consider",
+      "expected_benefit": "qualitative expected benefit only; do not invent percentages",
+      "confidence": "high|medium|low"
+    }
+  ]
+}
+
+Return at most 3 recommendations. If the evidence does not support a meaningful optimization, return fewer recommendations and explain in overview that more runs are needed.
+""".strip()
+
+    input_payload = {
+        "workflow": {
+            "id": workflow_id,
+            "name": workflow_name,
+        },
+        "process_mining_evidence": evidence,
+    }
+
+    try:
+        client = OpenAI(timeout=OPENAI_TIMEOUT_SECONDS)
+        response = client.responses.create(
+            model=OPENAI_MODEL,
+            instructions=instructions,
+            input=json.dumps(input_payload, ensure_ascii=False),
+        )
+    except APITimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Process Mining Advisor timed out.") from exc
+    except OpenAIError as exc:
+        raise HTTPException(status_code=502, detail="Process Mining Advisor is unavailable.") from exc
+
+    output_text = str(getattr(response, "output_text", "") or "").strip()
+    if not output_text:
+        raise HTTPException(status_code=502, detail="Process Mining Advisor returned an empty response.")
+
+    parsed = _extract_json(output_text)
+    evidence_strength = (
+        "limited" if analyzed_runs < 5
+        else "growing" if analyzed_runs < 20
+        else "stronger"
+    )
+    parsed.update(
+        {
+            "workflow_id": workflow_id,
+            "workflow_name": workflow_name,
+            "analyzed_runs": analyzed_runs,
+            "evidence_strength": evidence_strength,
+            "disclaimer": "LLM advice is generated only from Process Mining evidence. It is advisory and never changes the workflow automatically.",
+        }
+    )
+
+    try:
+        return ProcessMiningAdvisorResponse.model_validate(parsed)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Process Mining Advisor returned an invalid recommendation format.",
+        ) from exc
